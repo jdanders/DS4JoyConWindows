@@ -56,8 +56,9 @@ namespace DS4Windows
         internal const int RAZER_VID = 0x1532;
         internal const int NACON_VID = 0x146B;
         internal const int HORI_VID = 0x0F0D;
+        internal const int NINTENDO_VID = 0x057e;
 
-        // https://support.steampowered.com/kb_article.php?ref=5199-TOKV-4426&l=english web site has a list of other PS4 compatible device VID/PID values and brand names. 
+        // https://support.steampowered.com/kb_article.php?ref=5199-TOKV-4426&l=english web site has a list of other PS4 compatible device VID/PID values and brand names.
         // However, not all those are guaranteed to work with DS4Windows app so support is added case by case when users of DS4Windows app tests non-official DS4 gamepads.
 
         private static VidPidInfo[] knownDevices =
@@ -82,6 +83,10 @@ namespace DS4Windows
             new VidPidInfo(NACON_VID, 0x0D10, "Nacon Revol Infinite"), // Nacon Revolution Infinite (sometimes known as Revol Unlimited Pro v2?). Touchpad, gyro, rumble, "led indicator" lightbar.
             new VidPidInfo(HORI_VID, 0x0084, "Hori Fighting Cmd"), // Hori Fighting Commander (special kind of gamepad without touchpad or sticks. There is a hardware switch to alter d-pad type between dpad and LS/RS)
             new VidPidInfo(NACON_VID, 0x0D13, "Nacon Revol Pro v.3"),
+            new VidPidInfo(NINTENDO_VID, 0x2006, "Joy-Con L"),
+            new VidPidInfo(NINTENDO_VID, 0x2007, "Joy-Con R"),
+            new VidPidInfo(NINTENDO_VID, 0x2009, "Joy-Con Pro"),
+            new VidPidInfo(NINTENDO_VID, 0x200e, "Joy-Con Grip"),
         };
 
         private static string devicePathToInstanceId(string devicePath)
@@ -166,7 +171,7 @@ namespace DS4Windows
                             }
                             catch (Exception) { }
                         }
-                        
+
                         // TODO in exclusive mode, try to hold both open when both are connected
                         if (isExclusiveMode && !hDevice.IsOpen)
                             hDevice.OpenDevice(false);
@@ -205,7 +210,7 @@ namespace DS4Windows
                 }
             }
         }
-        
+
         // Returns DS4 controllers that were found and are running
         public static IEnumerable<DS4Device> getDS4Controllers()
         {
