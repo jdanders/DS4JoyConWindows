@@ -80,6 +80,23 @@ namespace DS4Windows
     }
 
     public enum ConnectionType : byte { BT, SONYWA, USB }; // Prioritize Bluetooth when both BT and USB are connected.
+    public enum BTType : byte { DS4, JOYCON};
+    public enum JoyConType : byte { LEFT, RIGHT, COMBO, PRO };
+    // See https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/
+    public enum JoyConInput : byte { SUB_REPLY = 0x21, FULL = 0x30, FULL_NFC = 0x31, NORMAL = 0x3f };
+    public enum JoyConCmd : byte { RUMBLE_WITH_SUBCMD = 0x01, RUMBLE_NO_SUBCMD = 0x10 };
+    public enum JoyConSubCmd : byte
+    {
+        BT_MANUAL_PAIR = 0x01,
+        SET_INPUT_MODE = 0x03,
+        SET_HCI_STATE = 0x06,
+        SET_LOW_POWER = 0x08,
+        SPI_FLASH_READ = 0x10,
+        SET_LIGHTS = 0x30, // LEDs on controller
+        ENABLE_IMU = 0x40, // 6-axis controller
+        ENABLE_VIBRATION = 0x48,
+    };
+
 
     /**
      * The haptics engine uses a stack of these states representing the light bar and rumble motor settings.
@@ -107,8 +124,8 @@ namespace DS4Windows
 
     public class DS4Device
     {
-        internal const int BT_OUTPUT_REPORT_LENGTH = 78;
-        internal const int BT_INPUT_REPORT_LENGTH = 547;
+        internal const int NINTENDO_VID = 0x057e;
+
         internal const int BT_OUTPUT_CHANGE_LENGTH = 13;
         internal const int USB_OUTPUT_CHANGE_LENGTH = 11;
         // Use large value for worst case scenario
@@ -129,6 +146,8 @@ namespace DS4Windows
         private DS4State cState = new DS4State();
         private DS4State pState = new DS4State();
         private ConnectionType conType;
+        private BTType joyType;
+        private JoyConType joyConType;
         private byte[] accel = new byte[6];
         private byte[] gyro = new byte[6];
         private byte[] inputReport;
@@ -196,6 +215,150 @@ namespace DS4Windows
         //public EventHandler<EventArgs> MotionEvent = null;
         public ReportHandler<EventArgs> MotionEvent = null;
 
+        public byte JoyConGlobalPacketNumber = 0;
+        // center point of calibration
+        public int JoyConStickOffsetLX;
+        public int JoyConStickOffsetLY;
+        public int JoyConStickOffsetRX;
+        public int JoyConStickOffsetRY;
+        // half of max-min, for scaling after subtracting offset
+        public int JoyConStickRangeLX;
+        public int JoyConStickRangeLY;
+        public int JoyConStickRangeRX;
+        public int JoyConStickRangeRY;
+
+        public byte[] JOYCON_RUMBLE_BASE = { 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40 };
+
+        public byte[] JoyConCommand(HidDevice hidDevice, JoyConCmd cmd, byte[] outputBuffer)
+        {
+            byte[] buf = new byte[outputBuffer.Length + 2];
+            buf[0] = (byte)cmd;
+            buf[1] = 0; // to be replaced with JoyConGlobalPacketNumber after change checks
+            outputBuffer.CopyTo(buf, 2);
+            return buf;
+        }
+
+        public byte[] JoyConSubcommand(HidDevice hidDevice, JoyConSubCmd subcmd, byte[] outputBuffer)
+        {
+            byte[] buf = new byte[outputBuffer.Length + 9];
+            byte[] rumble = JoyConRumble(hidDevice, currentHap.RumbleMotorStrengthRightLightFast,
+                                          currentHap.RumbleMotorStrengthLeftHeavySlow);
+            rumble.CopyTo(buf, 0);
+            buf[8] = (byte)subcmd;
+            outputBuffer.CopyTo(buf, 9);
+            return JoyConCommand(hidDevice, JoyConCmd.RUMBLE_WITH_SUBCMD, buf);
+        }
+
+        public byte[] JoyConReadSPI(HidDevice hidDevice, byte addr1, byte addr2, int len)
+        {
+            byte[] buf = {  addr2, addr1, 0x00, 0x00, (byte)len };
+            byte[] outbuf = new byte[hidDevice.Capabilities.OutputReportByteLength];
+            byte[] readbuf = new byte[hidDevice.Capabilities.InputReportByteLength];
+            byte[] result = new byte[len];
+            bool write_res;
+            HidDevice.ReadStatus read_res;
+            int tries = 0;
+            do
+            {
+                ++tries;
+                byte[] cmd = JoyConSubcommand(hidDevice, JoyConSubCmd.SPI_FLASH_READ, buf);
+                cmd.CopyTo(outbuf,0);
+                outbuf[1] = JoyConGlobalPacketNumber;
+                JoyConGlobalPacketNumber = (byte)((JoyConGlobalPacketNumber + 1) % 16);
+                write_res = hDevice.WriteOutputReportViaInterrupt(outbuf, READ_STREAM_TIMEOUT);
+                read_res = hDevice.ReadWithFileStream(readbuf);
+            } while (tries < 10 && !(readbuf[15] == addr2 && readbuf[16] == addr1));
+            Buffer.BlockCopy(readbuf, 20, result, 0, len);
+            return result;
+        }
+
+        public bool JoyConSubSend(HidDevice hidDevice, JoyConSubCmd subcmd, byte[] outputBuffer)
+        {
+            byte[] cmd = JoyConSubcommand(hidDevice, subcmd, outputBuffer);
+            cmd.CopyTo(outputReport,0);
+            return writeOutput();
+        }
+
+        public byte[] JoyConRumble(HidDevice hidDevice, byte rumb_fast, byte rumb_slow)
+        {
+            // XInput support two intensities, ranging from 0 to 65,535
+            // DS4 scales down 0 to 255
+            // Joy-Cons take frequency and amplitude
+            // https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/blob/master/rumble_data_table.md
+            // I measured 40Hz for low/slow, 120Hz for high/light
+            // When JoyCon is in dual mode, could output both independently.
+            // Maybe the two should be combined into an average freq?
+            //int sum = rumb_fast + rumb_slow;
+            //int avg_freq = ((rumb_fast*320 + rumb_slow*40) / sum);
+            // Maybe try alternating between two separate rumble commands instead of averaging freq?
+
+            // HB = high band, LB = low band, F = Freq, A = Amp
+            // byte 0    |    1      |          2    |    3   |
+            //   HBF_l   | HBA HBF_u |LBAen    LBF   |   LBA  |
+            //  -----------------------------------------------
+            // byte 3    |    2          |      1    |    0    |
+            //   LBA     | LBAen    LBF  |HBA  HBF_u |   HBF_l |
+            byte[] left_rumble = new byte[4];
+            // hbf freq is log(120/10,2)*32 = 114.7 --> (115 - 96)*4 = 0x4c
+            // lbf freq is log(40/10,2)*32 = 64 --> 64 - 64 = 0x00
+            // 160Hz for some reason: log(160/10,2)*32 = 128 --> 128 - 64 = 0x40
+            byte hbf_u = 0x00;
+            byte hbf_l = 0x4c;
+            byte lbf = (byte)((rumb_fast == 0 && rumb_slow == 0) ? 0x40 : 0x00);
+            // wiki describes a log function for amp, ignore and just go linear
+            // high band can be 0x00 - 0xc8, left shifted one
+            byte hba = (byte)((Math.Max(rumb_fast,rumb_slow)*100/256) * 2);
+            // low band can be 0x40 - 0x72, ignoring extra precision in byte 3
+            byte lba = (byte)((rumb_slow*100/256) / 2 + 64);
+            left_rumble[0] = hbf_l;
+            left_rumble[1] = (byte)(hba + hbf_u);
+            left_rumble[2] = (byte)(lbf + 0); // ignoring upper byte of lba
+            left_rumble[3] = lba;
+
+            byte[] buf = new byte[8];
+            left_rumble.CopyTo(buf, 0);
+            left_rumble.CopyTo(buf, 4);
+            return buf;
+        }
+
+        public byte[] JoyConOut(HidDevice hidDevice, byte rumb_fast, byte rumb_slow)
+        {
+            byte[] buf = JoyConRumble(hidDevice, rumb_fast, rumb_slow);
+            return JoyConCommand(hidDevice, JoyConCmd.RUMBLE_NO_SUBCMD, buf);
+        }
+
+        public byte JoyConStickAdjust(int raw, int offset, int range, int sense)
+        {
+            int scaled = sense * ((raw - offset)*256)/range + 128;
+            if (scaled > 119 && scaled < 138) scaled = 128; // dead zone
+            if (scaled > 255) scaled = 255;
+            if (scaled < 0) scaled = 0;
+            return (byte)(scaled);
+        }
+
+        public void JoyConInit(HidDevice hidDevice)
+        {
+            bool res;
+            byte[] light_id = { 0x01 };
+            byte[] enable = { 0x01 };
+            byte[] full_mode = { 0x30 };
+            res = JoyConSubSend(hDevice, JoyConSubCmd.SET_LIGHTS, light_id);
+            res = JoyConSubSend(hDevice, JoyConSubCmd.ENABLE_VIBRATION, enable);
+            res = JoyConSubSend(hDevice, JoyConSubCmd.ENABLE_IMU, enable);
+            // Set input to "Standard Full Mode". Default is "Simple HID", 0x3F
+            res = JoyConSubSend(hDevice, JoyConSubCmd.SET_INPUT_MODE, full_mode);
+        }
+
+        public void JoyConClose(HidDevice hidDevice)
+        {
+            bool res;
+            byte[] enable = { 0x01 };
+            byte[] disconnect = { 0x00 };
+            // Maybe should be made optional -- long button press to wake up
+            res = JoyConSubSend(hDevice, JoyConSubCmd.SET_LOW_POWER, enable);
+            //res = JoyConSubSend(hDevice, JoyConSubCmd.SET_HCI_STATE, disconnect);
+        }
+
         public HidDevice HidDevice => hDevice;
         public bool IsExclusive => HidDevice.IsExclusive;
         public bool isExclusive()
@@ -251,6 +414,18 @@ namespace DS4Windows
         public ConnectionType getConnectionType()
         {
             return this.conType;
+        }
+
+        public BTType BTType => joyType;
+        public BTType getBTType()
+        {
+            return this.joyType;
+        }
+
+        public JoyConType JoyConType => joyConType;
+        public JoyConType getJoyConType()
+        {
+            return this.joyConType;
         }
 
         // behavior only active when > 0
@@ -413,6 +588,33 @@ namespace DS4Windows
             return result;
         }
 
+        public static BTType HidBTType(HidDevice hidDevice)
+        {
+            BTType result = BTType.DS4;
+            if (hidDevice.Attributes.VendorId == NINTENDO_VID)
+            {
+                result = BTType.JOYCON;
+            }
+
+            return result;
+        }
+
+        public static JoyConType HidJoyConType(string displayName)
+        {
+            // Need a setting to choose COMBO or individual here
+            JoyConType result = JoyConType.COMBO;
+            if (displayName == "Joy-Con L")
+            {
+                result = JoyConType.LEFT;
+            }
+            else if (displayName == "Joy-Con R")
+            {
+                result = JoyConType.RIGHT;
+            }
+
+            return result;
+        }
+
         private Queue<Action> eventQueue = new Queue<Action>();
         private object eventQueueLock = new object();
 
@@ -433,9 +635,20 @@ namespace DS4Windows
             hDevice = hidDevice;
             displayName = disName;
             conType = HidConnectionType(hDevice);
+            joyType = HidBTType(hDevice);
             Mac = hDevice.readSerial();
             runCalib = true;
-            if (conType == ConnectionType.USB || conType == ConnectionType.SONYWA)
+            if (joyType == BTType.JOYCON)
+            {
+                joyConType = HidJoyConType(disName);
+                btInputReport = new byte[hDevice.Capabilities.InputReportByteLength];
+                inputReport = new byte[hDevice.Capabilities.InputReportByteLength - 2];
+                outputReport = new byte[hDevice.Capabilities.OutputReportByteLength];
+                outReportBuffer = new byte[hDevice.Capabilities.OutputReportByteLength];
+                warnInterval = WARN_INTERVAL_BT;
+                synced = isValidSerial();
+            }
+            else if (conType == ConnectionType.USB || conType == ConnectionType.SONYWA)
             {
                 inputReport = new byte[64];
                 outputReport = new byte[hDevice.Capabilities.OutputReportByteLength];
@@ -475,23 +688,28 @@ namespace DS4Windows
             }
             else
             {
-                btInputReport = new byte[BT_INPUT_REPORT_LENGTH];
-                inputReport = new byte[BT_INPUT_REPORT_LENGTH - 2];
-                outputReport = new byte[BT_OUTPUT_REPORT_LENGTH];
-                outReportBuffer = new byte[BT_OUTPUT_REPORT_LENGTH];
+                btInputReport = new byte[hDevice.Capabilities.InputReportByteLength];
+                inputReport = new byte[hDevice.Capabilities.InputReportByteLength - 2];
+                outputReport = new byte[hDevice.Capabilities.OutputReportByteLength];
+                outReportBuffer = new byte[hDevice.Capabilities.OutputReportByteLength];
                 warnInterval = WARN_INTERVAL_BT;
                 synced = isValidSerial();
             }
 
             touchpad = new DS4Touchpad();
             sixAxis = new DS4SixAxis();
+
             if (runCalib)
                 RefreshCalibration();
+
+            if (joyType == BTType.JOYCON) JoyConInit(hDevice);
 
             if (!hDevice.IsFileStreamOpen())
             {
                 hDevice.OpenFileStream(inputReport.Length);
             }
+
+
 
             sendOutputReport(true, true); // initialize the output report
         }
@@ -520,7 +738,80 @@ namespace DS4Windows
             byte[] calibration = new byte[41];
             calibration[0] = conType == ConnectionType.BT ? (byte)0x05 : (byte)0x02;
 
-            if (conType == ConnectionType.BT)
+            if (joyType == BTType.JOYCON)
+            {
+                if (!hDevice.IsFileStreamOpen())
+                {
+                    hDevice.OpenFileStream(inputReport.Length);
+                }
+                bool l_done = (joyConType == JoyConType.RIGHT);
+                bool r_done = (joyConType == JoyConType.LEFT);
+                byte[] RawCalL = new byte[9];
+                byte[] RawCalR = new byte[9];
+                int[] CalX = new int[3];
+                int[] CalY = new int[3];
+                // Read user stick calibration
+                byte[] SPICal = JoyConReadSPI(hDevice, 0x80, 0x10, 0x16);
+                // if there is user left stick calibration data:
+                if (SPICal[0] == 0xb2 && SPICal[1] == 0xa1)
+                {
+                    Buffer.BlockCopy(SPICal, 2, RawCalL, 0, 9);
+                    l_done = true;
+                    AppLogger.LogToGui("Joy-Con Left using user calibration data", false);
+                }
+                // if there is user right stick calibration data:
+                if (SPICal[0xb] == 0xb2 && SPICal[0xc] == 0xa1)
+                {
+                    Buffer.BlockCopy(SPICal, 0x1d, RawCalR, 0, 9);
+                    r_done = true;
+                    AppLogger.LogToGui("Joy-Con Left using user calibration data", false);
+                }
+                // if either user calibration is missing, read factory
+                if (!l_done || !r_done)
+                {
+                    // On the one Joy-Con I tried, factory was terrible
+                    // TODO: Add dialog to calibrate sticks (and write to SPI?!?!)
+                    SPICal = JoyConReadSPI(hDevice, 0x60, 0x3d, 0x12);
+                    // factory if not user left stick calibration data:
+                    if (!l_done)
+                    {
+                        Buffer.BlockCopy(SPICal, 0, RawCalL, 0, 9);
+                        l_done = true;
+                        AppLogger.LogToGui("Joy-Con Left using factory calibration data", true);
+                    }
+                    // factory if not user right stick calibration data:
+                    if (!r_done)
+                    {
+                        Buffer.BlockCopy(SPICal, 9, RawCalR, 0, 9);
+                        r_done = true;
+                        AppLogger.LogToGui("Joy-Con Left using factory calibration data", true);
+                    }
+                }
+                // Create left stick calibration
+                CalX[1] = (RawCalL[4] << 8) & 0xF00 | RawCalL[3];
+                CalY[1] = (RawCalL[5] << 4) | (RawCalL[4] >> 4);
+                CalX[0] = CalX[1] - ((RawCalL[7] << 8) & 0xF00 | RawCalL[6]);
+                CalY[0] = CalY[1] - ((RawCalL[8] << 4) | (RawCalL[7] >> 4));
+                CalX[2] = CalX[1] + ((RawCalL[1] << 8) & 0xF00 | RawCalL[0]);
+                CalY[2] = CalY[1] + ((RawCalL[2] << 4) | (RawCalL[2] >> 4));
+                JoyConStickOffsetLX = CalX[1];
+                JoyConStickRangeLX = (int)((CalX[2] - CalX[0])*.99); // Scale down to ensure max is hit
+                JoyConStickOffsetLY = CalY[1];
+                JoyConStickRangeLY = (int)((CalY[2] - CalY[0])*.99); // Scale down to ensure max is hit
+                // Create left stick calibration
+                CalX[1] = (RawCalR[4] << 8) & 0xF00 | RawCalR[3];
+                CalY[1] = (RawCalR[5] << 4) | (RawCalR[4] >> 4);
+                CalX[0] = CalX[1] - ((RawCalR[7] << 8) & 0xF00 | RawCalR[6]);
+                CalY[0] = CalY[1] - ((RawCalR[8] << 4) | (RawCalR[7] >> 4));
+                CalX[2] = CalX[1] + ((RawCalR[1] << 8) & 0xF00 | RawCalR[0]);
+                CalY[2] = CalY[1] + ((RawCalR[2] << 4) | (RawCalR[2] >> 4));
+                JoyConStickOffsetRX = CalX[1];
+                JoyConStickRangeRX = (int)((CalX[2] - CalX[0])*.99); // Scale down to ensure max is hit
+                JoyConStickOffsetRY = CalY[1];
+                JoyConStickRangeRY = (int)((CalY[2] - CalY[0])*.99); // Scale down to ensure max is hit
+
+            }
+            else if (conType == ConnectionType.BT)
             {
                 bool found = false;
                 for (int tries = 0; !found && tries < 5; tries++)
@@ -640,7 +931,34 @@ namespace DS4Windows
 
         private bool writeOutput()
         {
-            if (conType == ConnectionType.BT)
+            if (joyType == BTType.JOYCON)
+            {
+                HidDevice.ReadStatus read_res;
+                byte[] ignoredInput = new byte[hDevice.Capabilities.InputReportByteLength];
+                outputReport[1] = JoyConGlobalPacketNumber;
+                JoyConGlobalPacketNumber = (byte)((JoyConGlobalPacketNumber + 1) % 16);
+                bool write_res = hDevice.WriteOutputReportViaInterrupt(outputReport, READ_STREAM_TIMEOUT);
+                if (write_res)
+                {
+                    // It seems the joy-con won't take more outputs until it
+                    // is read, even if there is nothing to read
+                    if (outputReport[0] == (byte)JoyConCmd.RUMBLE_WITH_SUBCMD)
+                    {
+                        // Subcommands return results, sync read to be sure success
+                        read_res = hDevice.ReadWithFileStream(ignoredInput);
+                    }
+                    else
+                    {
+                        read_res = hDevice.ReadAsyncWithFileStream(ignoredInput, 0);
+                    }
+                    if (read_res == HidDevice.ReadStatus.Success || read_res == HidDevice.ReadStatus.WaitTimedOut)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            else if (conType == ConnectionType.BT)
             {
                 return hDevice.WriteOutputReportViaControl(outputReport);
             }
@@ -690,10 +1008,21 @@ namespace DS4Windows
                         lock (outReportBuffer)
                         {
                             Monitor.Wait(outReportBuffer);
-                            fixed (byte* byteR = outputReport, byteB = outReportBuffer)
+                            if (joyType == BTType.JOYCON)
                             {
-                                for (int i = 0, arlen = BT_OUTPUT_CHANGE_LENGTH; i < arlen; i++)
-                                    byteR[i] = byteB[i];
+                                fixed (byte* byteR = outputReport, byteB = outReportBuffer)
+                                {
+                                    for (int i = 0, arlen = hDevice.Capabilities.OutputReportByteLength; i < arlen; i++)
+                                        byteR[i] = byteB[i];
+                                }
+                            }
+                            else
+                            {
+                                fixed (byte* byteR = outputReport, byteB = outReportBuffer)
+                                {
+                                    for (int i = 0, arlen = BT_OUTPUT_CHANGE_LENGTH; i < arlen; i++)
+                                        byteR[i] = byteB[i];
+                                }
                             }
                             //outReportBuffer.CopyTo(outputReport, 0);
                             if (outputPendCount > 1)
@@ -755,7 +1084,7 @@ namespace DS4Windows
         uint deltaTimeCurrent = 0;
 
 
-        const int BT_INPUT_REPORT_CRC32_POS = BT_OUTPUT_REPORT_LENGTH - 4; //last 4 bytes of the 78-sized input report are crc32
+        const int BT_INPUT_REPORT_CRC32_POS = 78 - 4; //last 4 bytes of the 78-sized input report are crc32
         public const uint DefaultPolynomial = 0xedb88320u;
         uint HamSeed = 2351727372;
 
@@ -819,30 +1148,34 @@ namespace DS4Windows
                         timeoutEvent = false;
                         if (res == HidDevice.ReadStatus.Success)
                         {
+                            int offset = joyType == BTType.DS4 ? 2 : 0;
                             //Array.Copy(btInputReport, 2, inputReport, 0, inputReport.Length);
-                            fixed (byte* byteP = &btInputReport[2], imp = inputReport)
+                            fixed (byte* byteP = &btInputReport[offset], imp = inputReport)
                             {
-                                for (int j = 0; j < BT_INPUT_REPORT_LENGTH - 2; j++)
+                                for (int j = 0; j < hDevice.Capabilities.InputReportByteLength - offset; j++)
                                 {
                                     imp[j] = byteP[j];
                                 }
                             }
 
-                            //uint recvCrc32 = BitConverter.ToUInt32(btInputReport, BT_INPUT_REPORT_CRC32_POS);
-                            uint recvCrc32 = btInputReport[BT_INPUT_REPORT_CRC32_POS] |
-                                (uint)(btInputReport[CRC32_POS_1] << 8) |
-                                (uint)(btInputReport[CRC32_POS_2] << 16) |
-                                (uint)(btInputReport[CRC32_POS_3] << 24);
-
-                            uint calcCrc32 = ~Crc32Algorithm.CalculateFasterBTHash(ref HamSeed, ref btInputReport, ref crcoffset, ref crcpos);
-                            if (recvCrc32 != calcCrc32)
+                            if (joyType == BTType.DS4)
                             {
-                                //Log.LogToGui("Crc check failed", true);
-                                //Console.WriteLine(MacAddress.ToString() + " " + System.DateTime.UtcNow.ToString("o") + "" +
-                                //                    "> invalid CRC32 in BT input report: 0x" + recvCrc32.ToString("X8") + " expected: 0x" + calcCrc32.ToString("X8"));
+                                //uint recvCrc32 = BitConverter.ToUInt32(btInputReport, BT_INPUT_REPORT_CRC32_POS);
+                                uint recvCrc32 = btInputReport[BT_INPUT_REPORT_CRC32_POS] |
+                                    (uint)(btInputReport[CRC32_POS_1] << 8) |
+                                    (uint)(btInputReport[CRC32_POS_2] << 16) |
+                                    (uint)(btInputReport[CRC32_POS_3] << 24);
 
-                                cState.PacketCounter = pState.PacketCounter + 1; //still increase so we know there were lost packets
-                                continue;
+                                uint calcCrc32 = ~Crc32Algorithm.CalculateFasterBTHash(ref HamSeed, ref btInputReport, ref crcoffset, ref crcpos);
+                                if (recvCrc32 != calcCrc32)
+                                    {
+                                        //Log.LogToGui("Crc check failed", true);
+                                        //Console.WriteLine(MacAddress.ToString() + " " + System.DateTime.UtcNow.ToString("o") + "" +
+                                        //                    "> invalid CRC32 in BT input report: 0x" + recvCrc32.ToString("X8") + " expected: 0x" + calcCrc32.ToString("X8"));
+
+                                        cState.PacketCounter = pState.PacketCounter + 1; //still increase so we know there were lost packets
+                                        continue;
+                                    }
                             }
                         }
                         else
@@ -904,7 +1237,7 @@ namespace DS4Windows
                     oldtime = curtime;
                     oldTimeDouble = curTimeDouble;
 
-                    if (conType == ConnectionType.BT && btInputReport[0] != 0x11)
+                    if (conType == ConnectionType.BT && joyType != BTType.JOYCON && btInputReport[0] != 0x11)
                     {
                         //Received incorrect report, skip it
                         continue;
@@ -914,177 +1247,300 @@ namespace DS4Windows
 
                     cState.PacketCounter = pState.PacketCounter + 1;
                     cState.ReportTimeStamp = utcNow;
-                    cState.LX = inputReport[1];
-                    cState.LY = inputReport[2];
-                    cState.RX = inputReport[3];
-                    cState.RY = inputReport[4];
-                    cState.L2 = inputReport[8];
-                    cState.R2 = inputReport[9];
 
-                    tempByte = inputReport[5];
-                    cState.Triangle = (tempByte & (1 << 7)) != 0;
-                    cState.Circle = (tempByte & (1 << 6)) != 0;
-                    cState.Cross = (tempByte & (1 << 5)) != 0;
-                    cState.Square = (tempByte & (1 << 4)) != 0;
-
-                    // First 4 bits denote dpad state. Clock representation
-                    // with 8 meaning centered and 0 meaning DpadUp.
-                    byte dpad_state = (byte)(tempByte & 0x0F);
-
-                    switch (dpad_state)
+                    if (joyType == BTType.DS4)
                     {
-                        case 0: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = false; break;
-                        case 1: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = true; break;
-                        case 2: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = true; break;
-                        case 3: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = false; cState.DpadRight = true; break;
-                        case 4: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = false; cState.DpadRight = false; break;
-                        case 5: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = true; cState.DpadRight = false; break;
-                        case 6: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = true; cState.DpadRight = false; break;
-                        case 7: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = true; cState.DpadRight = false; break;
-                        case 8:
-                        default: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = false; break;
-                    }
+                        cState.LX = inputReport[1];
+                        cState.LY = inputReport[2];
+                        cState.RX = inputReport[3];
+                        cState.RY = inputReport[4];
+                        cState.L2 = inputReport[8];
+                        cState.R2 = inputReport[9];
 
-                    tempByte = inputReport[6];
-                    cState.R3 = (tempByte & (1 << 7)) != 0;
-                    cState.L3 = (tempByte & (1 << 6)) != 0;
-                    cState.Options = (tempByte & (1 << 5)) != 0;
-                    cState.Share = (tempByte & (1 << 4)) != 0;
-                    cState.R2Btn = (inputReport[6] & (1 << 3)) != 0;
-                    cState.L2Btn = (inputReport[6] & (1 << 2)) != 0;
-                    cState.R1 = (tempByte & (1 << 1)) != 0;
-                    cState.L1 = (tempByte & (1 << 0)) != 0;
+                        tempByte = inputReport[5];
+                        cState.Triangle = (tempByte & (1 << 7)) != 0;
+                        cState.Circle = (tempByte & (1 << 6)) != 0;
+                        cState.Cross = (tempByte & (1 << 5)) != 0;
+                        cState.Square = (tempByte & (1 << 4)) != 0;
 
-                    tempByte = inputReport[7];
-                    cState.PS = (tempByte & (1 << 0)) != 0;
-                    cState.TouchButton = (tempByte & 0x02) != 0;
-                    cState.TouchButton = (tempByte & 0x02) != 0;
-                    cState.FrameCounter = (byte)(tempByte >> 2);
+                        // First 4 bits denote dpad state. Clock representation
+                        // with 8 meaning centered and 0 meaning DpadUp.
+                        byte dpad_state = (byte)(tempByte & 0x0F);
 
-                    tempByte = inputReport[30];
-                    tempCharging = (tempByte & 0x10) != 0;
-                    if (tempCharging != charging)
-                    {
-                        charging = tempCharging;
-                        ChargingChanged?.Invoke(this, EventArgs.Empty);
-                    }
-
-                    maxBatteryValue = charging ? BATTERY_MAX_USB : BATTERY_MAX;
-                    tempBattery = (tempByte & 0x0f) * 100 / maxBatteryValue;
-                    tempBattery = Math.Min(tempBattery, 100);
-                    if (tempBattery != battery)
-                    {
-                        battery = tempBattery;
-                        BatteryChanged?.Invoke(this, EventArgs.Empty);
-                    }
-
-                    cState.Battery = (byte)battery;
-                    //System.Diagnostics.Debug.WriteLine("CURRENT BATTERY: " + (inputReport[30] & 0x0f) + " | " + tempBattery + " | " + battery);
-                    if (tempByte != priorInputReport30)
-                    {
-                        priorInputReport30 = tempByte;
-                        //Console.WriteLine(MacAddress.ToString() + " " + System.DateTime.UtcNow.ToString("o") + "> power subsystem octet: 0x" + inputReport[30].ToString("x02"));
-                    }
-
-                    tempStamp = (uint)((ushort)(inputReport[11] << 8) | inputReport[10]);
-                    if (timeStampInit == false)
-                    {
-                        timeStampInit = true;
-                        deltaTimeCurrent = tempStamp * 16u / 3u;
-                    }
-                    else if (timeStampPrevious > tempStamp)
-                    {
-                        tempDelta = ushort.MaxValue - timeStampPrevious + tempStamp + 1u;
-                        deltaTimeCurrent = tempDelta * 16u / 3u;
-                    }
-                    else
-                    {
-                        tempDelta = tempStamp - timeStampPrevious;
-                        deltaTimeCurrent = tempDelta * 16u / 3u;
-                    }
-
-                    timeStampPrevious = tempStamp;
-                    elapsedDeltaTime = 0.000001 * deltaTimeCurrent; // Convert from microseconds to seconds
-                    cState.elapsedTime = elapsedDeltaTime;
-                    cState.totalMicroSec = pState.totalMicroSec + deltaTimeCurrent;
-
-                    //Simpler touch storing
-                    cState.TrackPadTouch0.Id = (byte)(inputReport[35] & 0x7f);
-                    cState.TrackPadTouch0.IsActive = (inputReport[35] & 0x80) == 0;
-                    cState.TrackPadTouch0.X = (short)(((ushort)(inputReport[37] & 0x0f) << 8) | (ushort)(inputReport[36]));
-                    cState.TrackPadTouch0.Y = (short)(((ushort)(inputReport[38]) << 4) | ((ushort)(inputReport[37] & 0xf0) >> 4));
-
-                    cState.TrackPadTouch1.Id = (byte)(inputReport[39] & 0x7f);
-                    cState.TrackPadTouch1.IsActive = (inputReport[39] & 0x80) == 0;
-                    cState.TrackPadTouch1.X = (short)(((ushort)(inputReport[41] & 0x0f) << 8) | (ushort)(inputReport[40]));
-                    cState.TrackPadTouch1.Y = (short)(((ushort)(inputReport[42]) << 4) | ((ushort)(inputReport[41] & 0xf0) >> 4));
-
-                    // XXX DS4State mapping needs fixup, turn touches into an array[4] of structs.  And include the touchpad details there instead.
-                    try
-                    {
-                        // Only care if one touch packet is detected. Other touch packets
-                        // don't seem to contain relevant data. ds4drv does not use them either.
-                        for (int touches = Math.Max((int)(inputReport[-1 + DS4Touchpad.TOUCHPAD_DATA_OFFSET - 1]), 1), touchOffset = 0; touches > 0; touches--, touchOffset += 9)
-                        //for (int touches = inputReport[-1 + DS4Touchpad.TOUCHPAD_DATA_OFFSET - 1], touchOffset = 0; touches > 0; touches--, touchOffset += 9)
-                        {
-                            cState.TouchPacketCounter = inputReport[-1 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset];
-                            cState.Touch1 = (inputReport[0 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] >> 7) != 0 ? false : true; // finger 1 detected
-                            cState.Touch1Identifier = (byte)(inputReport[0 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] & 0x7f);
-                            cState.Touch2 = (inputReport[4 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] >> 7) != 0 ? false : true; // finger 2 detected
-                            cState.Touch2Identifier = (byte)(inputReport[4 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] & 0x7f);
-                            cState.Touch1Finger = cState.Touch1 || cState.Touch2; // >= 1 touch detected
-                            cState.Touch2Fingers = cState.Touch1 && cState.Touch2; // 2 touches detected
-                            int touchX = (((inputReport[2 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] & 0xF) << 8) | inputReport[1 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset]);
-                            cState.TouchLeft = touchX >= 1920 * 2 / 5 ? false : true;
-                            cState.TouchRight = touchX < 1920 * 2 / 5 ? false : true;
-                            // Even when idling there is still a touch packet indicating no touch 1 or 2
-                            touchpad.handleTouchpad(inputReport, cState, touchOffset);
-                        }
-                    }
-                    catch { currerror = "Index out of bounds: touchpad"; }
-
-                    // Store Gyro and Accel values
-                    //Array.Copy(inputReport, 13, gyro, 0, 6);
-                    //Array.Copy(inputReport, 19, accel, 0, 6);
-                    fixed (byte* pbInput = &inputReport[13], pbGyro = gyro, pbAccel = accel)
-                    {
-                        for (int i = 0; i < 6; i++)
-                        {
-                            pbGyro[i] = pbInput[i];
-                        }
-
-                        for (int i = 6; i < 12; i++)
-                        {
-                            pbAccel[i - 6] = pbInput[i];
-                        }
-
-                        sixAxis.handleSixaxis(pbGyro, pbAccel, cState, elapsedDeltaTime);
-                    }
-
-                    /* Debug output of incoming HID data:
-                    if (cState.L2 == 0xff && cState.R2 == 0xff)
-                    {
-                        Console.Write(MacAddress.ToString() + " " + System.DateTime.UtcNow.ToString("o") + ">");
-                        for (int i = 0; i < inputReport.Length; i++)
-                            Console.Write(" " + inputReport[i].ToString("x2"));
-                        Console.WriteLine();
-                    }
-                    */
-
-                    if (conType == ConnectionType.SONYWA)
-                    {
-                        bool controllerSynced = inputReport[31] == 0;
-                        if (controllerSynced != synced)
-                        {
-                            runCalib = synced = controllerSynced;
-                            SyncChange?.Invoke(this, EventArgs.Empty);
-                            if (synced)
+                        switch (dpad_state)
                             {
-                                forceWrite = true;
+                            case 0: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = false; break;
+                            case 1: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = true; break;
+                            case 2: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = true; break;
+                            case 3: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = false; cState.DpadRight = true; break;
+                            case 4: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = false; cState.DpadRight = false; break;
+                            case 5: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = true; cState.DpadRight = false; break;
+                            case 6: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = true; cState.DpadRight = false; break;
+                            case 7: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = true; cState.DpadRight = false; break;
+                            case 8:
+                            default: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = false; break;
                             }
-                            else
+
+                        tempByte = inputReport[6];
+                        cState.R3 = (tempByte & (1 << 7)) != 0;
+                        cState.L3 = (tempByte & (1 << 6)) != 0;
+                        cState.Options = (tempByte & (1 << 5)) != 0;
+                        cState.Share = (tempByte & (1 << 4)) != 0;
+                        cState.R2Btn = (inputReport[6] & (1 << 3)) != 0;
+                        cState.L2Btn = (inputReport[6] & (1 << 2)) != 0;
+                        cState.R1 = (tempByte & (1 << 1)) != 0;
+                        cState.L1 = (tempByte & (1 << 0)) != 0;
+
+                        tempByte = inputReport[7];
+                        cState.PS = (tempByte & (1 << 0)) != 0;
+                        cState.TouchButton = (tempByte & 0x02) != 0;
+                        cState.TouchButton = (tempByte & 0x02) != 0;
+                        cState.FrameCounter = (byte)(tempByte >> 2);
+
+                        tempByte = inputReport[30];
+                        tempCharging = (tempByte & 0x10) != 0;
+                        if (tempCharging != charging)
                             {
-                                standbySw.Reset();
+                                charging = tempCharging;
+                                ChargingChanged?.Invoke(this, EventArgs.Empty);
+                            }
+
+                        maxBatteryValue = charging ? BATTERY_MAX_USB : BATTERY_MAX;
+                        tempBattery = (tempByte & 0x0f) * 100 / maxBatteryValue;
+                        tempBattery = Math.Min(tempBattery, 100);
+                        if (tempBattery != battery)
+                            {
+                                battery = tempBattery;
+                                BatteryChanged?.Invoke(this, EventArgs.Empty);
+                            }
+
+                        cState.Battery = (byte)battery;
+                        //System.Diagnostics.Debug.WriteLine("CURRENT BATTERY: " + (inputReport[30] & 0x0f) + " | " + tempBattery + " | " + battery);
+                        if (tempByte != priorInputReport30)
+                            {
+                                priorInputReport30 = tempByte;
+                                //Console.WriteLine(MacAddress.ToString() + " " + System.DateTime.UtcNow.ToString("o") + "> power subsystem octet: 0x" + inputReport[30].ToString("x02"));
+                            }
+
+                        tempStamp = (uint)((ushort)(inputReport[11] << 8) | inputReport[10]);
+                        if (timeStampInit == false)
+                            {
+                                timeStampInit = true;
+                                deltaTimeCurrent = tempStamp * 16u / 3u;
+                            }
+                        else if (timeStampPrevious > tempStamp)
+                            {
+                                tempDelta = ushort.MaxValue - timeStampPrevious + tempStamp + 1u;
+                                deltaTimeCurrent = tempDelta * 16u / 3u;
+                            }
+                        else
+                            {
+                                tempDelta = tempStamp - timeStampPrevious;
+                                deltaTimeCurrent = tempDelta * 16u / 3u;
+                            }
+
+                        timeStampPrevious = tempStamp;
+                        elapsedDeltaTime = 0.000001 * deltaTimeCurrent; // Convert from microseconds to seconds
+                        cState.elapsedTime = elapsedDeltaTime;
+                        cState.totalMicroSec = pState.totalMicroSec + deltaTimeCurrent;
+
+                        //Simpler touch storing
+                        cState.TrackPadTouch0.Id = (byte)(inputReport[35] & 0x7f);
+                        cState.TrackPadTouch0.IsActive = (inputReport[35] & 0x80) == 0;
+                        cState.TrackPadTouch0.X = (short)(((ushort)(inputReport[37] & 0x0f) << 8) | (ushort)(inputReport[36]));
+                        cState.TrackPadTouch0.Y = (short)(((ushort)(inputReport[38]) << 4) | ((ushort)(inputReport[37] & 0xf0) >> 4));
+
+                        cState.TrackPadTouch1.Id = (byte)(inputReport[39] & 0x7f);
+                        cState.TrackPadTouch1.IsActive = (inputReport[39] & 0x80) == 0;
+                        cState.TrackPadTouch1.X = (short)(((ushort)(inputReport[41] & 0x0f) << 8) | (ushort)(inputReport[40]));
+                        cState.TrackPadTouch1.Y = (short)(((ushort)(inputReport[42]) << 4) | ((ushort)(inputReport[41] & 0xf0) >> 4));
+
+                        // XXX DS4State mapping needs fixup, turn touches into an array[4] of structs.  And include the touchpad details there instead.
+                        try
+                            {
+                                // Only care if one touch packet is detected. Other touch packets
+                                // don't seem to contain relevant data. ds4drv does not use them either.
+                                for (int touches = Math.Max((int)(inputReport[-1 + DS4Touchpad.TOUCHPAD_DATA_OFFSET - 1]), 1), touchOffset = 0; touches > 0; touches--, touchOffset += 9)
+                                    //for (int touches = inputReport[-1 + DS4Touchpad.TOUCHPAD_DATA_OFFSET - 1], touchOffset = 0; touches > 0; touches--, touchOffset += 9)
+                                    {
+                                        cState.TouchPacketCounter = inputReport[-1 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset];
+                                        cState.Touch1 = (inputReport[0 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] >> 7) != 0 ? false : true; // finger 1 detected
+                                        cState.Touch1Identifier = (byte)(inputReport[0 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] & 0x7f);
+                                        cState.Touch2 = (inputReport[4 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] >> 7) != 0 ? false : true; // finger 2 detected
+                                        cState.Touch2Identifier = (byte)(inputReport[4 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] & 0x7f);
+                                        cState.Touch1Finger = cState.Touch1 || cState.Touch2; // >= 1 touch detected
+                                        cState.Touch2Fingers = cState.Touch1 && cState.Touch2; // 2 touches detected
+                                        int touchX = (((inputReport[2 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset] & 0xF) << 8) | inputReport[1 + DS4Touchpad.TOUCHPAD_DATA_OFFSET + touchOffset]);
+                                        cState.TouchLeft = touchX >= 1920 * 2 / 5 ? false : true;
+                                        cState.TouchRight = touchX < 1920 * 2 / 5 ? false : true;
+                                        // Even when idling there is still a touch packet indicating no touch 1 or 2
+                                        touchpad.handleTouchpad(inputReport, cState, touchOffset);
+                                    }
+                            }
+                        catch { currerror = "Index out of bounds: touchpad"; }
+
+                        // Store Gyro and Accel values
+                        //Array.Copy(inputReport, 13, gyro, 0, 6);
+                        //Array.Copy(inputReport, 19, accel, 0, 6);
+                        fixed (byte* pbInput = &inputReport[13], pbGyro = gyro, pbAccel = accel)
+                            {
+                                for (int i = 0; i < 6; i++)
+                                    {
+                                        pbGyro[i] = pbInput[i];
+                                    }
+
+                                for (int i = 6; i < 12; i++)
+                                    {
+                                        pbAccel[i - 6] = pbInput[i];
+                                    }
+
+                                sixAxis.handleSixaxis(pbGyro, pbAccel, cState, elapsedDeltaTime);
+                            }
+
+                        /* Debug output of incoming HID data:
+                           if (cState.L2 == 0xff && cState.R2 == 0xff)
+                           {
+                           Console.Write(MacAddress.ToString() + " " + System.DateTime.UtcNow.ToString("o") + ">");
+                           for (int i = 0; i < inputReport.Length; i++)
+                           Console.Write(" " + inputReport[i].ToString("x2"));
+                           Console.WriteLine();
+                           }
+                        */
+
+                        if (conType == ConnectionType.SONYWA)
+                            {
+                                bool controllerSynced = inputReport[31] == 0;
+                                if (controllerSynced != synced)
+                                    {
+                                        runCalib = synced = controllerSynced;
+                                        SyncChange?.Invoke(this, EventArgs.Empty);
+                                        if (synced)
+                                            {
+                                                forceWrite = true;
+                                            }
+                                        else
+                                            {
+                                                standbySw.Reset();
+                                            }
+                                    }
+                            }
+                    }
+                    else if (joyType == BTType.JOYCON)
+                    {
+                        if (inputReport[0] == (byte)JoyConInput.NORMAL)
+                        {
+                            tempByte = inputReport[1];
+                            cState.Triangle = (tempByte & 0x08) != 0;
+                            cState.Circle = (tempByte & 0x02) != 0;
+                            cState.Cross = (tempByte & 0x01) != 0;
+                            cState.Square = (tempByte & 0x04) != 0;
+                            cState.L1 = (tempByte & 0x10) != 0;
+                            cState.R1 = (tempByte & 0x20) != 0;
+                            cState.L2Btn = (tempByte & 0x10) != 0;
+                            cState.R2Btn = (tempByte & 0x20) != 0;
+                            tempByte = inputReport[2];
+                            cState.Options = (tempByte & 0x20) != 0;
+                            cState.Share = (tempByte & 0x01) != 0;
+                            // First 4 bits denote dpad state. Clock representation
+                            // with 8 meaning centered and 0 meaning DpadUp.
+                            byte dpad_state = inputReport[3];
+
+                            switch (dpad_state)
+                            {
+                            case 0: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = false; break;
+                            case 1: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = true; break;
+                            case 2: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = true; break;
+                            case 3: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = false; cState.DpadRight = true; break;
+                            case 4: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = false; cState.DpadRight = false; break;
+                            case 5: cState.DpadUp = false; cState.DpadDown = true; cState.DpadLeft = true; cState.DpadRight = false; break;
+                            case 6: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = true; cState.DpadRight = false; break;
+                            case 7: cState.DpadUp = true; cState.DpadDown = false; cState.DpadLeft = true; cState.DpadRight = false; break;
+                            case 8:
+                            default: cState.DpadUp = false; cState.DpadDown = false; cState.DpadLeft = false; cState.DpadRight = false; break;
+                            }
+                            //AppLogger.LogToGui(inputReport[0].ToString() + ", " + inputReport[1].ToString() + ", " + inputReport[2].ToString() + ", " + inputReport[3].ToString(), false);
+                        }
+                        else if (inputReport[0] == (byte)JoyConInput.FULL
+                                 || inputReport[0] == (byte)JoyConInput.FULL_NFC
+                                 || inputReport[0] == (byte)JoyConInput.SUB_REPLY)
+                        {
+                            // btn_data
+                            if (joyConType == JoyConType.LEFT)
+                            {
+                                int raw_x = inputReport[6] | ((inputReport[7] & 0xF) << 8);
+                                int raw_y = (inputReport[7] >> 4) | (inputReport[8] << 4);
+                                // JoyCon on its side flips axes and directions
+                                cState.LY = JoyConStickAdjust(raw_x, JoyConStickOffsetLX, JoyConStickRangeLX, -1);
+                                cState.LX = JoyConStickAdjust(raw_y, JoyConStickOffsetLY, JoyConStickRangeLY, -1);
+                                //AppLogger.LogToGui(cState.LX.ToString() + ", " + cState.LY.ToString() + ", " + (raw_x).ToString() + ", " + (raw_y).ToString(), false);
+
+                                tempByte = inputReport[5];
+                                cState.Triangle = (tempByte & 0x04) != 0;
+                                cState.Circle = (tempByte & 0x01) != 0;
+                                cState.Cross = (tempByte & 0x08) != 0;
+                                cState.Square = (tempByte & 0x02) != 0;
+                                cState.L1 = (tempByte & 0x20) != 0;
+                                cState.R1 = (tempByte & 0x10) != 0;
+                                cState.L2Btn = (tempByte & 0x20) != 0;
+                                cState.R2Btn = (tempByte & 0x10) != 0;
+                                tempByte = inputReport[4];
+                                cState.Options = (tempByte & 0x20) != 0;
+                                cState.Share = (tempByte & 0x01) != 0;
+                                cState.L3 = (tempByte & 0x08) != 0;
+                            }
+                            else if (joyConType == JoyConType.RIGHT)
+                            {
+                                int raw_x = inputReport[9] | ((inputReport[10] & 0xF) << 8);
+                                int raw_y = (inputReport[10] >> 4) | (inputReport[11] << 4);
+                                // JoyCon on its side flips axes
+                                cState.LY = JoyConStickAdjust(raw_x, JoyConStickOffsetRX, JoyConStickRangeRX, 1);
+                                cState.LX = JoyConStickAdjust(raw_y, JoyConStickOffsetRY, JoyConStickRangeRY, 1);
+
+                                tempByte = inputReport[3];
+                                cState.Triangle = (tempByte & 0x01) != 0;
+                                cState.Circle = (tempByte & 0x02) != 0;
+                                cState.Cross = (tempByte & 0x08) != 0;
+                                cState.Square = (tempByte & 0x04) != 0;
+                                cState.L1 = (tempByte & 0x20) != 0;
+                                cState.R1 = (tempByte & 0x10) != 0;
+                                cState.L2Btn = (tempByte & 0x20) != 0;
+                                cState.R2Btn = (tempByte & 0x10) != 0;
+                                tempByte = inputReport[4];
+                                cState.Options = (tempByte & 0x02) != 0;
+                                cState.Share = (tempByte & 0x10) != 0;
+                                cState.L3 = (tempByte & 0x04) != 0;
+                            }
+
+                            // Charging/Battery
+                            tempByte = inputReport[2];
+                            tempCharging = (tempByte & 0x10) != 0;
+                            if (tempCharging != charging)
+                            {
+                                charging = tempCharging;
+                                ChargingChanged?.Invoke(this, EventArgs.Empty);
+                            }
+
+                            switch ((tempByte >> 4) & 0x0f)
+                            {
+                            case 0x8: tempBattery = 100; break;
+                            case 0x6: tempBattery = 75; break;
+                            case 0x4: tempBattery = 50; break;
+                            case 0x2: tempBattery = 25; break;
+                            case 0x0: tempBattery = 0; break;
+                            }
+
+                            if (tempBattery != battery)
+                            {
+                                battery = tempBattery;
+                                BatteryChanged?.Invoke(this, EventArgs.Empty);
+                            }
+
+                            cState.Battery = (byte)battery;
+                            //System.Diagnostics.Debug.WriteLine("CURRENT BATTERY: " + (inputReport[30] & 0x0f) + " | " + tempBattery + " | " + battery);
+                            if (tempByte != priorInputReport30)
+                            {
+                                priorInputReport30 = tempByte;
+                                //Console.WriteLine(MacAddress.ToString() + " " + System.DateTime.UtcNow.ToString("o") + "> power subsystem octet: 0x" + inputReport[30].ToString("x02"));
                             }
                         }
                     }
@@ -1214,7 +1670,20 @@ namespace DS4Windows
                 bool output = outputPendCount > 0, change = force;
                 bool haptime = output || standbySw.ElapsedMilliseconds >= 4000L;
 
-                if (usingBT)
+                if (joyType == BTType.JOYCON)
+                {
+                    byte[] joyOut = JoyConOut(hDevice, currentHap.RumbleMotorStrengthRightLightFast,
+                                              currentHap.RumbleMotorStrengthLeftHeavySlow);
+                    joyOut.CopyTo(outReportBuffer, 0);
+                    fixed (byte* byteR = outputReport, byteB = outReportBuffer)
+                    {
+                        for (int i = 2, arlen = joyOut.Length; !change && i < arlen; i++)
+                            change = byteR[i] != byteB[i];
+                    }
+
+                    haptime = haptime || change;
+                }
+                else if (usingBT)
                 {
                     outReportBuffer[0] = 0x11;
                     outReportBuffer[1] = (byte)(0x80 | btPollRate); // input report rate
@@ -1380,7 +1849,10 @@ namespace DS4Windows
                 long lbtAddr = BitConverter.ToInt64(btAddr, 0);
 
                 bool success = false;
-
+                if (joyType == BTType.JOYCON)
+                {
+                    JoyConClose(hDevice);
+                }
                 lock (outputReport)
                 {
                     NativeMethods.BLUETOOTH_FIND_RADIO_PARAMS p = new NativeMethods.BLUETOOTH_FIND_RADIO_PARAMS();
@@ -1402,7 +1874,6 @@ namespace DS4Windows
                     NativeMethods.BluetoothFindRadioClose(searchHandle);
                     Console.WriteLine("Disconnect successful: " + success);
                 }
-
                 success = true; // XXX return value indicates failure, but it still works?
                 if (success)
                 {

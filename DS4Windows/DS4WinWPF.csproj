@@ -24,6 +24,7 @@
     <DefineConstants>DEBUG;TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
@@ -107,10 +108,10 @@
       <SpecificVersion>False</SpecificVersion>
     </Reference>
     <Reference Include="Nefarius.ViGEm.Client" Condition="'$(Platform)' == 'x64'&#xD;&#xA;">
-      <HintPath>.\libs\x64\Nefarius.ViGEm.Client\Nefarius.ViGEm.Client.dll</HintPath>
+      <HintPath>libs\x64\Nefarius.ViGEm.Client\Nefarius.ViGEm.Client.dll</HintPath>
     </Reference>
     <Reference Include="Nefarius.ViGEm.Client" Condition="'$(Platform)' == 'x86'&#xD;&#xA;">
-      <HintPath>.\libs\x86\Nefarius.ViGEm.Client\Nefarius.ViGEm.Client.dll</HintPath>
+      <HintPath>libs\x86\Nefarius.ViGEm.Client\Nefarius.ViGEm.Client.dll</HintPath>
     </Reference>
     <Reference Include="NLog, Version=4.0.0.0, Culture=neutral, PublicKeyToken=5120e14c03d0593c, processorArchitecture=MSIL">
       <HintPath>..\packages\NLog.4.6.8\lib\net45\NLog.dll</HintPath>
@@ -409,6 +410,7 @@
   </ItemGroup>
   <ItemGroup>
     <Resource Include="Resources\BT.png" />
+    <Resource Include="Resources\JoyCon.png" />
     <Resource Include="Resources\cancel.png" />
     <Resource Include="Resources\checked.png" />
     <Resource Include="Resources\copy.png" />
