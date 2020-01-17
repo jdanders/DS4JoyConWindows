@@ -249,7 +249,8 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             get
             {
                 string source = device.ConnectionType == ConnectionType.USB ? "/DS4Windows;component/Resources/USB.png"
-                    : "/DS4Windows;component/Resources/BT.png";
+                    : (device.getBTType() == BTType.JOYCON ? "/DS4Windows;component/Resources/JoyCon.png"
+                       : "/DS4Windows;component/Resources/BT.png");
                 return source;
             }
         }
