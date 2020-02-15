@@ -787,6 +787,7 @@ namespace DS4Windows
                         AppLogger.LogToGui("Joy-Con Left using factory calibration data", true);
                     }
                 }
+                // 0 is center, 1 is max, 2 is min
                 // Create left stick calibration
                 CalX[1] = (RawCalL[4] << 8) & 0xF00 | RawCalL[3];
                 CalY[1] = (RawCalL[5] << 4) | (RawCalL[4] >> 4);
@@ -798,13 +799,13 @@ namespace DS4Windows
                 JoyConStickRangeLX = (int)((CalX[2] - CalX[0])*.99); // Scale down to ensure max is hit
                 JoyConStickOffsetLY = CalY[1];
                 JoyConStickRangeLY = (int)((CalY[2] - CalY[0])*.99); // Scale down to ensure max is hit
-                // Create left stick calibration
-                CalX[1] = (RawCalR[4] << 8) & 0xF00 | RawCalR[3];
-                CalY[1] = (RawCalR[5] << 4) | (RawCalR[4] >> 4);
-                CalX[0] = CalX[1] - ((RawCalR[7] << 8) & 0xF00 | RawCalR[6]);
-                CalY[0] = CalY[1] - ((RawCalR[8] << 4) | (RawCalR[7] >> 4));
-                CalX[2] = CalX[1] + ((RawCalR[1] << 8) & 0xF00 | RawCalR[0]);
-                CalY[2] = CalY[1] + ((RawCalR[2] << 4) | (RawCalR[2] >> 4));
+                // Create right stick calibration
+                CalX[0] = (RawCalR[4] << 8) & 0xF00 | RawCalR[3];
+                CalY[0] = (RawCalR[5] << 4) | (RawCalR[4] >> 4);
+                CalX[2] = CalX[1] - ((RawCalR[7] << 8) & 0xF00 | RawCalR[6]);
+                CalY[2] = CalY[1] - ((RawCalR[8] << 4) | (RawCalR[7] >> 4));
+                CalX[1] = CalX[1] + ((RawCalR[1] << 8) & 0xF00 | RawCalR[0]);
+                CalY[1] = CalY[1] + ((RawCalR[2] << 4) | (RawCalR[2] >> 4));
                 JoyConStickOffsetRX = CalX[1];
                 JoyConStickRangeRX = (int)((CalX[2] - CalX[0])*.99); // Scale down to ensure max is hit
                 JoyConStickOffsetRY = CalY[1];
@@ -1487,8 +1488,9 @@ namespace DS4Windows
                                 int raw_x = inputReport[9] | ((inputReport[10] & 0xF) << 8);
                                 int raw_y = (inputReport[10] >> 4) | (inputReport[11] << 4);
                                 // JoyCon on its side flips axes
-                                cState.LY = JoyConStickAdjust(raw_x, JoyConStickOffsetRX, JoyConStickRangeRX, 1);
-                                cState.LX = JoyConStickAdjust(raw_y, JoyConStickOffsetRY, JoyConStickRangeRY, 1);
+                                cState.LY = JoyConStickAdjust(raw_x, JoyConStickOffsetRX, JoyConStickRangeRX, -1);
+                                cState.LX = JoyConStickAdjust(raw_y, JoyConStickOffsetRY, JoyConStickRangeRY, -1);
+                                //AppLogger.LogToGui(cState.LX.ToString() + ", " + cState.LY.ToString() + ", " + (raw_x).ToString() + ", " + (raw_y).ToString(), false);
 
                                 tempByte = inputReport[3];
                                 cState.Triangle = (tempByte & 0x01) != 0;
